@@ -1,0 +1,108 @@
+============================================================
+  RTS Manufacturing System - Timing Log
+============================================================
+Generated at: SystemTime { intervals: 134125744741513201 }
+
+=== Sensor Generation ===
+  Iterations: 500
+  Min: 0.300 us
+  Max: 21.300 us
+  Mean: 0.804 us
+  Std Dev: 2.457 us
+  P50: 0.400 us
+  P95: 0.600 us
+  P99: 13.600 us
+  Jitter: 21.000 us
+
+=== Data Processing ===
+  Iterations: 500
+  Min: 0.800 us
+  Max: 2.900 us
+  Mean: 0.937 us
+  Std Dev: 0.137 us
+  P50: 0.900 us
+  P95: 1.100 us
+  P99: 1.100 us
+  Jitter: 2.100 us
+
+=== Data Transmission ===
+  Iterations: 500
+  Min: 0.000 us
+  Max: 1.500 us
+  Mean: 0.077 us
+  Std Dev: 0.077 us
+  P50: 0.100 us
+  P95: 0.100 us
+  P99: 0.100 us
+  Jitter: 1.500 us
+
+=== Actuator Reception ===
+  Iterations: 500
+  Min: 0.000 us
+  Max: 0.600 us
+  Mean: 0.073 us
+  Std Dev: 0.051 us
+  P50: 0.100 us
+  P95: 0.100 us
+  P99: 0.100 us
+  Jitter: 0.600 us
+
+=== PID Control ===
+  Iterations: 500
+  Min: 0.100 us
+  Max: 16.800 us
+  Mean: 0.207 us
+  Std Dev: 0.744 us
+  P50: 0.200 us
+  P95: 0.200 us
+  P99: 0.200 us
+  Jitter: 16.700 us
+
+=== Feedback Transmission ===
+  Iterations: 0
+  Min: 0.000 us
+  Max: 0.000 us
+  Mean: 0.000 us
+  Std Dev: 0.000 us
+  P50: 0.000 us
+  P95: 0.000 us
+  P99: 0.000 us
+  Jitter: 0.000 us
+
+=== End-to-End Latency ===
+  Iterations: 200
+  Min: 7.900 us
+  Max: 143.100 us
+  Mean: 15.658 us
+  Std Dev: 13.625 us
+  P50: 9.900 us
+  P95: 41.200 us
+  P99: 65.200 us
+  Jitter: 135.200 us
+
+=== Lock Contention ===
+  Iterations: 0
+  Min: 0.000 us
+  Max: 0.000 us
+  Mean: 0.000 us
+  Std Dev: 0.000 us
+  P50: 0.000 us
+  P95: 0.000 us
+  P99: 0.000 us
+  Jitter: 0.000 us
+
+=== Throughput Summary ===
+  Min: 63576.83 ops/sec
+  Max: 63576.83 ops/sec
+  Avg: 63576.83 ops/sec
+
+=== Deadline Analysis ===
+  Processing Deadline (200.0 us):
+    Violations: 0 / 500 (0.00%)
+  Transmission Deadline (100.0 us):
+    Violations: 0 / 500 (0.00%)
+  Actuator Control Deadline (2000.0 us):
+    Violations: 0 / 500 (0.00%)
+  Feedback Deadline (500.0 us):
+    Violations: 0 / 0 (0.00%)
+============================================================
