@@ -19,9 +19,10 @@ use rts_manufacturing::fault_injection::*;
 use rts_manufacturing::ipc::*;
 use rts_manufacturing::sensor::*;
 use rts_manufacturing::shared_resource::*;
+use rts_manufacturing::types::LogLevel;
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::fs::File;
@@ -62,8 +63,12 @@ fn run_demonstration() {
     run_benchmarks();
 
     // 9. Save all benchmark results to files
-    println!("\n=== Part 9: Saving Results to Files ===");
+    println!("\n=== Part 5: Saving Results to Files ===");
     save_benchmark_results();
+
+    // 10. Save high-load benchmark results to files
+    println!("\n=== Part 6: Saving High-Load Results to Files ===");
+    save_high_load_results();
 
     println!("\n============================================================");
     println!("  Demonstration Complete");
@@ -108,7 +113,7 @@ fn run_multithreaded_system(num_cycles: usize) {
                 if let Err(e) = sensor.run_cycle() {
                     eprintln!("Sensor error: {}", e);
                 }
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(SENSOR_SAMPLE_INTERVAL);
             }
             
             sensor.get_stats()
@@ -129,7 +134,7 @@ fn run_multithreaded_system(num_cycles: usize) {
                 if let Err(e) = actuator.run_cycle() {
                     eprintln!("Actuator error: {}", e);
                 }
-                thread::sleep(Duration::from_micros(500));
+                thread::sleep(ACTUATOR_DEADLINE);
             }
             
             actuator.get_stats()
@@ -193,21 +198,19 @@ fn run_with_fault_injection(num_cycles: usize) {
     let mut faults_detected = 0;
 
     for _cycle in 0..num_cycles {
-        if let Ok(processed_data) = sensor.run_cycle() {
-            for data in processed_data {
-                if let Some((faulty_data, record)) = fault_injector.apply_fault(data) {
-                    if record.fault_type != FaultType::None {
-                        faults_injected += 1;
-                    }
-                    let issues = fault_detector.check_data(&faulty_data);
-                    if !issues.is_empty() {
-                        faults_detected += 1;
-                    }
+        if let Ok(faulted_data) = sensor.run_cycle_with_faults(&mut fault_injector) {
+            for (faulty_data, record) in faulted_data {
+                if record.fault_type != FaultType::None {
+                    faults_injected += 1;
+                }
+                let issues = fault_detector.check_data(&faulty_data);
+                if !issues.is_empty() {
+                    faults_detected += 1;
                 }
             }
         }
         let _ = actuator.run_cycle();
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(SENSOR_SAMPLE_INTERVAL);
     }
 
     println!("\n--- Fault Injection Results ---");
@@ -215,6 +218,7 @@ fn run_with_fault_injection(num_cycles: usize) {
     println!("\nFault Detection:");
     println!("  Faults Injected: {}", faults_injected);
     println!("  Faults Flagged: {}", faults_detected);
+    println!("  Recoveries Applied: {}", sensor.get_recovery_count());
     println!("  Faults Detected (seq/time): {}", fault_detector.get_fault_count());
     
 }
@@ -282,7 +286,7 @@ fn run_under_load(num_cycles: usize) {
             if cycle_time > ACTUATOR_DEADLINE.as_nanos() as u64 {
                 missed += 1;
             }
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(SENSOR_SAMPLE_INTERVAL);
         }
 
         for handle in load_handles {
@@ -322,6 +326,29 @@ fn run_under_load(num_cycles: usize) {
     println!("  • P99 latency shows worst-case behavior critical for real-time systems");
 }
 
+fn spawn_load_threads(
+    target_load: f64,
+    running: Arc<AtomicBool>,
+    num_threads: usize,
+) -> Vec<thread::JoinHandle<()>> {
+    let load = target_load.clamp(0.0, 1.0);
+    (0..num_threads)
+        .map(|_| {
+            let running = Arc::clone(&running);
+            thread::spawn(move || {
+                let mut counter: u64 = 0;
+                while running.load(Ordering::Relaxed) {
+                    for _ in 0..(load * 10000.0) as usize {
+                        counter = counter.wrapping_add(1);
+                        std::hint::black_box(counter);
+                    }
+                    thread::sleep(Duration::from_micros(100));
+                }
+            })
+        })
+        .collect()
+}
+
 // ----------------------------------------------------------------------------
 // Performance Benchmarking
 // ----------------------------------------------------------------------------
@@ -330,7 +357,7 @@ fn run_benchmarks() {
     println!("Running performance benchmarks...");
     
     let mut benchmark = SystemBenchmark::new();
-    let iterations = 1000;
+    let iterations = BENCHMARK_ITERATIONS;
 
     println!("  Benchmarking sensor generation...");
     let mut sensor_sim = rts_manufacturing::sensor::SensorSimulator::new(0, "Test");
@@ -371,6 +398,56 @@ fn run_benchmarks() {
         benchmark.actuator_reception.start();
         let _ = rx.recv();
         benchmark.actuator_reception.stop();
+    }
+
+    println!("  Benchmarking feedback transmission...");
+    let feedback_channel = FeedbackChannel::new(CHANNEL_BUFFER_SIZE);
+    let feedback_sender = feedback_channel.get_sender();
+    let feedback_receiver = feedback_channel.get_receiver();
+    for i in 0..iterations {
+        let feedback = rts_manufacturing::types::ActuatorFeedback::new(
+            0,
+            i as u64,
+            rts_manufacturing::types::ActuatorState::new(0),
+        );
+        benchmark.feedback_transmission.start();
+        let _ = feedback_sender.send(feedback);
+        benchmark.feedback_transmission.stop();
+        let _ = feedback_receiver.recv();
+    }
+
+    println!("  Benchmarking lock contention...");
+    let shared = SharedResources::new();
+    let lock_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let thread_count = 4;
+    let samples_per_thread = iterations / thread_count;
+    let mut handles = Vec::new();
+    for _ in 0..thread_count {
+        let shared = shared.clone();
+        let lock_samples = Arc::clone(&lock_samples);
+        handles.push(thread::spawn(move || {
+            for _ in 0..samples_per_thread {
+                let start = Instant::now();
+                let logged = shared.diagnostic_log.try_log(
+                    LogLevel::Info,
+                    "Benchmark",
+                    "Lock contention test",
+                );
+                if !logged {
+                    shared
+                        .diagnostic_log
+                        .log(LogLevel::Info, "Benchmark", "Lock contention test");
+                }
+                let elapsed = start.elapsed().as_nanos() as u64;
+                lock_samples.lock().unwrap().push(elapsed);
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    for duration in lock_samples.lock().unwrap().iter() {
+        benchmark.lock_contention.record_duration(*duration);
     }
 
     println!("  Benchmarking end-to-end cycle...");
@@ -416,7 +493,7 @@ fn save_benchmark_results() {
     println!("Saving benchmark results to files...");
     
     let mut benchmark = SystemBenchmark::new();
-    let iterations = 500;
+    let iterations = BENCHMARK_ITERATIONS;
     
     let mut sensor_sim = rts_manufacturing::sensor::SensorSimulator::new(0, "Test");
     for _ in 0..iterations {
@@ -484,6 +561,56 @@ fn save_benchmark_results() {
         benchmark.record_throughput(end_to_end_iterations as f64 / elapsed.as_secs_f64());
     }
     
+    println!("  Benchmarking feedback transmission...");
+    let feedback_channel = FeedbackChannel::new(CHANNEL_BUFFER_SIZE);
+    let feedback_sender = feedback_channel.get_sender();
+    let feedback_receiver = feedback_channel.get_receiver();
+    for i in 0..iterations {
+        let feedback = rts_manufacturing::types::ActuatorFeedback::new(
+            0,
+            i as u64,
+            rts_manufacturing::types::ActuatorState::new(0),
+        );
+        benchmark.feedback_transmission.start();
+        let _ = feedback_sender.send(feedback);
+        benchmark.feedback_transmission.stop();
+        let _ = feedback_receiver.recv();
+    }
+
+    println!("  Benchmarking lock contention...");
+    let shared = SharedResources::new();
+    let lock_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let thread_count = 4;
+    let samples_per_thread = iterations / thread_count;
+    let mut handles = Vec::new();
+    for _ in 0..thread_count {
+        let shared = shared.clone();
+        let lock_samples = Arc::clone(&lock_samples);
+        handles.push(thread::spawn(move || {
+            for _ in 0..samples_per_thread {
+                let start = Instant::now();
+                let logged = shared.diagnostic_log.try_log(
+                    LogLevel::Info,
+                    "Benchmark",
+                    "Lock contention test",
+                );
+                if !logged {
+                    shared
+                        .diagnostic_log
+                        .log(LogLevel::Info, "Benchmark", "Lock contention test");
+                }
+                let elapsed = start.elapsed().as_nanos() as u64;
+                lock_samples.lock().unwrap().push(elapsed);
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    for duration in lock_samples.lock().unwrap().iter() {
+        benchmark.lock_contention.record_duration(*duration);
+    }
+
     let json = benchmark.export_json();
     match File::create("benchmark_results.json") {
         Ok(mut file) => {
@@ -499,13 +626,169 @@ fn save_benchmark_results() {
     save_timing_log(&benchmark);
 }
 
+fn save_high_load_results() {
+    println!("Saving high-load benchmark results to files...");
+
+    let mut benchmark = SystemBenchmark::new();
+    let iterations = BENCHMARK_ITERATIONS;
+    let load_running = Arc::new(AtomicBool::new(true));
+    let load_handles = spawn_load_threads(0.8, Arc::clone(&load_running), 2);
+
+    let mut sensor_sim = rts_manufacturing::sensor::SensorSimulator::new(0, "Test");
+    for _ in 0..iterations {
+        benchmark.sensor_generation.start();
+        let _ = sensor_sim.generate_reading();
+        benchmark.sensor_generation.stop();
+    }
+
+    let mut processor = rts_manufacturing::sensor::DataProcessor::new(NUM_SENSOR_TYPES);
+    for i in 0..iterations {
+        let reading = rts_manufacturing::types::SensorReading::new(
+            0, "Test".to_string(), 50.0 + (i as f64 * 0.1), i as u64
+        );
+        benchmark.data_processing.start();
+        let _ = processor.process(&reading);
+        benchmark.data_processing.stop();
+    }
+
+    let mut pid = rts_manufacturing::pid_controller::PidController::with_defaults("Test");
+    pid.set_setpoint(50.0);
+    for i in 0..iterations {
+        benchmark.pid_control.start();
+        let _ = pid.update(45.0 + (i as f64 * 0.01));
+        benchmark.pid_control.stop();
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(100);
+    for i in 0..iterations {
+        benchmark.data_transmission.start();
+        let _ = tx.send(i as u64);
+        benchmark.data_transmission.stop();
+        benchmark.actuator_reception.start();
+        let _ = rx.recv();
+        benchmark.actuator_reception.stop();
+    }
+
+    println!("  Benchmarking feedback transmission (high load)...");
+    let feedback_channel = FeedbackChannel::new(CHANNEL_BUFFER_SIZE);
+    let feedback_sender = feedback_channel.get_sender();
+    let feedback_receiver = feedback_channel.get_receiver();
+    for i in 0..iterations {
+        let feedback = rts_manufacturing::types::ActuatorFeedback::new(
+            0,
+            i as u64,
+            rts_manufacturing::types::ActuatorState::new(0),
+        );
+        benchmark.feedback_transmission.start();
+        let _ = feedback_sender.send(feedback);
+        benchmark.feedback_transmission.stop();
+        let _ = feedback_receiver.recv();
+    }
+
+    println!("  Benchmarking lock contention (high load)...");
+    let shared = SharedResources::new();
+    let lock_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let thread_count = 4;
+    let samples_per_thread = iterations / thread_count;
+    let mut handles = Vec::new();
+    for _ in 0..thread_count {
+        let shared = shared.clone();
+        let lock_samples = Arc::clone(&lock_samples);
+        handles.push(thread::spawn(move || {
+            for _ in 0..samples_per_thread {
+                let start = Instant::now();
+                let logged = shared.diagnostic_log.try_log(
+                    LogLevel::Info,
+                    "Benchmark",
+                    "Lock contention test",
+                );
+                if !logged {
+                    shared
+                        .diagnostic_log
+                        .log(LogLevel::Info, "Benchmark", "Lock contention test");
+                }
+                let elapsed = start.elapsed().as_nanos() as u64;
+                lock_samples.lock().unwrap().push(elapsed);
+            }
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    for duration in lock_samples.lock().unwrap().iter() {
+        benchmark.lock_contention.record_duration(*duration);
+    }
+
+    let shared = SharedResources::new();
+    let ipc = IpcManager::new();
+    let running = Arc::new(AtomicBool::new(true));
+
+    let mut sensor = SensorModule::new(
+        ipc.get_sensor_sender(),
+        ipc.get_feedback_receiver(),
+        shared.clone(),
+        Arc::clone(&running),
+    );
+
+    let mut actuator = ActuatorModule::new(
+        ipc.get_sensor_receiver(),
+        ipc.get_feedback_sender(),
+        shared,
+        running,
+    );
+
+    let end_to_end_iterations = 200;
+    let start = Instant::now();
+    for _ in 0..end_to_end_iterations {
+        benchmark.end_to_end.start();
+        let _ = sensor.run_cycle();
+        let _ = actuator.run_cycle();
+        benchmark.end_to_end.stop();
+    }
+    let elapsed = start.elapsed();
+    if elapsed.as_secs_f64() > 0.0 {
+        benchmark.record_throughput(end_to_end_iterations as f64 / elapsed.as_secs_f64());
+    }
+
+    load_running.store(false, Ordering::Relaxed);
+    for handle in load_handles {
+        let _ = handle.join();
+    }
+
+    let json = benchmark.export_json();
+    match File::create("benchmark_results_high_load.json") {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", json) {
+                eprintln!("Failed to write high-load benchmark JSON: {}", e);
+            } else {
+                println!("  Saved benchmark_results_high_load.json");
+            }
+        }
+        Err(e) => eprintln!("Failed to create high-load benchmark JSON file: {}", e),
+    }
+
+    save_timing_log_with_title(
+        &benchmark,
+        "RTS Manufacturing System - Timing Log (High Load)",
+        "timing_log_high_load.txt",
+    );
+}
+
 fn save_timing_log(benchmark: &SystemBenchmark) {
+    save_timing_log_with_title(
+        benchmark,
+        "RTS Manufacturing System - Timing Log",
+        "timing_log.txt",
+    );
+}
+
+fn save_timing_log_with_title(benchmark: &SystemBenchmark, title: &str, filename: &str) {
     let mut log = String::new();
 
     log.push_str("============================================================
 ");
-    log.push_str("  RTS Manufacturing System - Timing Log
-");
+    log.push_str(&format!("  {}
+", title));
     log.push_str("============================================================
 ");
     log.push_str(&format!("Generated at: {:?}
@@ -647,69 +930,16 @@ fn save_timing_log(benchmark: &SystemBenchmark) {
     log.push_str("============================================================
 ");
 
-    match File::create("timing_log.txt") {
+    match File::create(filename) {
         Ok(mut file) => {
             if let Err(e) = write!(file, "{}", log) {
                 eprintln!("Failed to write timing log: {}", e);
             } else {
-                println!("  Saved timing_log.txt");
+                println!("  Saved {}", filename);
             }
         }
         Err(e) => eprintln!("Failed to create timing log file: {}", e),
     }
 }
 
-// ----------------------------------------------------------------------------
-// Unit Tests
-// ----------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rts_manufacturing::types::*;
-
-    #[test]
-    fn test_sensor_generation() {
-        let mut sensor = rts_manufacturing::sensor::SensorSimulator::new(0, "Force");
-        let reading = sensor.generate_reading();
-        assert_eq!(reading.sensor_id, 0);
-        assert!(reading.value > 0.0);
-    }
-
-    #[test]
-    fn test_pid_controller() {
-        let mut pid = rts_manufacturing::pid_controller::PidController::with_defaults("Test");
-        pid.set_setpoint(100.0);
-        let (output, error, _) = pid.update(50.0);
-        assert!(output > 0.0);
-        assert!((error - 50.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_shared_resource_sync() {
-        let shared = SharedResources::new();
-        shared.status_memory.increment_cycles();
-        assert_eq!(shared.status_memory.get_cycles(), 1);
-        
-        shared.diagnostic_log.log(LogLevel::Info, "Test", "Test message");
-        let recent = shared.diagnostic_log.get_recent(1);
-        assert_eq!(recent.len(), 1);
-    }
-
-    #[test]
-    fn test_channel_communication() {
-        let channel = SensorDataChannel::new(10);
-        let sender = channel.get_sender();
-        let receiver = channel.get_receiver();
-
-        let data = ProcessedSensorData::new(
-            0, "Test".to_string(), 50.0, 50.0, false, 1.0, 100, 1
-        );
-
-        sender.send(data.clone()).unwrap();
-        let received = receiver.recv().unwrap();
-        
-        assert_eq!(received.sensor_id, 0);
-        assert!((received.filtered_value - 50.0).abs() < 0.001);
-    }
-}

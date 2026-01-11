@@ -51,6 +51,11 @@ impl BenchmarkTimer {
         }
     }
 
+    /// Record a precomputed duration
+    pub fn record_duration(&mut self, duration_ns: u64) {
+        self.durations.push(duration_ns);
+    }
+
     /// Get all recorded durations
     pub fn get_durations(&self) -> &[u64] {
         &self.durations
@@ -279,6 +284,17 @@ impl SystemBenchmark {
         println!("    Violations: {} / {} ({:.2}%)", 
             act_violations, act_stats.count,
             if act_stats.count > 0 { act_violations as f64 / act_stats.count as f64 * 100.0 } else { 0.0 });
+
+        let fb_deadline_ns = FEEDBACK_DEADLINE.as_nanos() as u64;
+        let fb_violations = self.feedback_transmission.get_durations()
+            .iter()
+            .filter(|&&d| d > fb_deadline_ns)
+            .count();
+        let fb_stats = self.feedback_transmission.get_stats();
+        println!("  Feedback Deadline ({:.1} µs):", fb_deadline_ns as f64 / 1000.0);
+        println!("    Violations: {} / {} ({:.2}%)", 
+            fb_violations, fb_stats.count,
+            if fb_stats.count > 0 { fb_violations as f64 / fb_stats.count as f64 * 100.0 } else { 0.0 });
     }
 
     /// Export results to JSON

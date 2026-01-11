@@ -350,11 +350,12 @@ pub struct FaultDetector {
 impl FaultDetector {
     /// Create a new fault detector
     pub fn new(num_sensors: usize) -> Self {
+        let max_timestamp_gap_ns = SENSOR_SAMPLE_INTERVAL.as_nanos() as u128 * 2;
         Self {
             expected_sequences: vec![0; num_sensors],
-            max_sequence_gap: 2,
+            max_sequence_gap: 0,
             last_timestamps: vec![0; num_sensors],
-            max_timestamp_gap_ns: 50_000_000, // 50ms
+            max_timestamp_gap_ns,
             detected_faults: 0,
         }
     }
@@ -364,9 +365,11 @@ impl FaultDetector {
     pub fn check_data(&mut self, data: &ProcessedSensorData) -> Vec<String> {
         let mut issues = Vec::new();
         let sensor_id = data.sensor_id;
+        let mut fault_detected = false;
 
         if sensor_id >= self.expected_sequences.len() {
             issues.push(format!("Unknown sensor ID: {}", sensor_id));
+            self.detected_faults += 1;
             return issues;
         }
 
@@ -377,7 +380,7 @@ impl FaultDetector {
                 "Sequence gap detected: expected {}, got {}",
                 expected, data.sequence
             ));
-            self.detected_faults += 1;
+            fault_detected = true;
         }
         self.expected_sequences[sensor_id] = data.sequence + 1;
 
@@ -386,7 +389,7 @@ impl FaultDetector {
         if last_ts > 0 && data.timestamp_ns > last_ts + self.max_timestamp_gap_ns {
             let gap_ms = (data.timestamp_ns - last_ts) / 1_000_000;
             issues.push(format!("Timestamp gap of {} ms detected", gap_ms));
-            self.detected_faults += 1;
+            fault_detected = true;
         }
         self.last_timestamps[sensor_id] = data.timestamp_ns;
 
@@ -396,11 +399,17 @@ impl FaultDetector {
                 "Anomaly flagged: value={:.2}, confidence={:.2}",
                 data.filtered_value, data.confidence
             ));
+            fault_detected = true;
         }
 
         // Check confidence
         if data.confidence < 0.5 {
             issues.push(format!("Low confidence reading: {:.2}", data.confidence));
+            fault_detected = true;
+        }
+
+        if fault_detected {
+            self.detected_faults += 1;
         }
 
         issues

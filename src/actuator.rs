@@ -15,7 +15,8 @@ use crate::shared_resource::*;
 use crate::types::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 // ----------------------------------------------------------------------------
@@ -121,7 +122,7 @@ impl VirtualActuator {
 /// Complete actuator module with reception, control, and feedback
 pub struct ActuatorModule {
     /// Virtual actuators
-    actuators: Vec<VirtualActuator>,
+    actuators: Vec<Arc<Mutex<VirtualActuator>>>,
     /// PID controllers for each actuator
     controllers: PidControllerBank,
     /// Data receiver channel
@@ -153,8 +154,8 @@ impl ActuatorModule {
         running: Arc<AtomicBool>,
     ) -> Self {
         // Create actuators for each type
-        let actuators: Vec<VirtualActuator> = (0..NUM_ACTUATORS)
-            .map(|i| VirtualActuator::new(i, ACTUATOR_NAMES[i]))
+        let actuators: Vec<Arc<Mutex<VirtualActuator>>> = (0..NUM_ACTUATORS)
+            .map(|i| Arc::new(Mutex::new(VirtualActuator::new(i, ACTUATOR_NAMES[i]))))
             .collect();
 
         // Initialize setpoints to reasonable defaults
@@ -184,7 +185,7 @@ impl ActuatorModule {
 
         // Phase 1: Receive sensor data
         let rx_start = Instant::now();
-        let sensor_data = self.receive_data()?;
+        let mut sensor_data = self.receive_data()?;
         let rx_time = rx_start.elapsed().as_nanos() as u64;
         self.reception_times.push(rx_time);
 
@@ -193,66 +194,104 @@ impl ActuatorModule {
             return Ok(feedbacks);
         }
 
-        // Phase 2: Control each actuator based on sensor data
-        for data in &sensor_data {
-            let ctrl_start = Instant::now();
-            
-            // Map sensor to actuator (simple 1:1 mapping)
+        // Prioritize anomalies first, then by sequence for stable ordering.
+        sensor_data.sort_by(|a, b| {
+            let pa = if a.is_anomaly { 2 } else { 1 };
+            let pb = if b.is_anomaly { 2 } else { 1 };
+            pb.cmp(&pa).then_with(|| a.sequence.cmp(&b.sequence))
+        });
+
+        // Phase 2: Control each actuator concurrently based on sensor data
+        let mut grouped: Vec<Vec<ProcessedSensorData>> = vec![Vec::new(); NUM_ACTUATORS];
+        for data in sensor_data {
             let actuator_id = data.sensor_id % NUM_ACTUATORS;
-            
-            // Get PID controller output
-            if let Some(controller) = self.controllers.get_controller(actuator_id) {
-                controller.set_setpoint(self.setpoints[actuator_id]);
-                let (output, error, _dt) = controller.update(data.filtered_value);
-                
-                let scaled_output = output;
-                
-                // Create command
-                let command = ActuatorCommand::new(
-                    actuator_id,
-                    ACTUATOR_NAMES[actuator_id].to_string(),
-                    scaled_output,
-                    if data.is_anomaly { 0 } else { 1 }, // Lower priority for anomalies
-                    data.sensor_id,
-                    data.sequence,
-                );
+            grouped[actuator_id].push(data);
+        }
 
-                // Apply command to actuator
-                let state = self.actuators[actuator_id].apply_command(command);
-                
-                let ctrl_time = ctrl_start.elapsed().as_nanos() as u64;
-                self.control_times.push(ctrl_time);
+        let feedback_sender = self.feedback_sender.clone();
+        let setpoints = self.setpoints.clone();
+        let mut handles = Vec::new();
 
-                // Check actuator deadline
-                if ctrl_time > ACTUATOR_DEADLINE.as_nanos() as u64 {
-                    self.missed_deadlines += 1;
-                }
-
-                // Phase 3: Send feedback
-                let fb_start = Instant::now();
-                let mut feedback = ActuatorFeedback::new(actuator_id, data.sequence, state);
-                feedback.response_time_ns = ctrl_time;
-
-                // Add calibration suggestion if error is consistently high
-                if error.abs() > 10.0 {
-                    feedback.calibration_adjustment = Some(-error * 0.1);
-                }
-
-                // Send feedback
-                if let Err(e) = self.feedback_sender.try_send(feedback.clone()) {
-                    feedback.error_message = Some(format!("Feedback send failed: {}", e));
-                }
-
-                let fb_time = fb_start.elapsed().as_nanos() as u64;
-                self.feedback_times.push(fb_time);
-
-                // Check feedback deadline
-                if fb_time > FEEDBACK_DEADLINE.as_nanos() as u64 {
-                    self.missed_deadlines += 1;
-                }
-
-                feedbacks.push(feedback);
+        for (actuator_id, data_group) in grouped.into_iter().enumerate() {
+            if data_group.is_empty() {
+                continue;
             }
+
+            let actuator = Arc::clone(&self.actuators[actuator_id]);
+            let controller = match self.controllers.get_controller(actuator_id) {
+                Some(controller) => controller,
+                None => continue,
+            };
+            let feedback_sender = feedback_sender.clone();
+            let setpoint = setpoints[actuator_id];
+
+            handles.push(thread::spawn(move || {
+                let mut local_feedbacks = Vec::new();
+                let mut control_times = Vec::new();
+                let mut feedback_times = Vec::new();
+                let mut missed_deadlines = 0;
+
+                for data in data_group {
+                    let ctrl_start = Instant::now();
+
+                    let (output, error, _dt) = {
+                        let mut controller = controller.lock().unwrap();
+                        controller.set_setpoint(setpoint);
+                        controller.update(data.filtered_value)
+                    };
+
+                    let priority = if data.is_anomaly { 2 } else { 1 };
+                    let command = ActuatorCommand::new(
+                        actuator_id,
+                        ACTUATOR_NAMES[actuator_id].to_string(),
+                        output,
+                        priority,
+                        data.sensor_id,
+                        data.sequence,
+                    );
+
+                    let state = {
+                        let mut actuator = actuator.lock().unwrap();
+                        actuator.apply_command(command)
+                    };
+
+                    let ctrl_time = ctrl_start.elapsed().as_nanos() as u64;
+                    control_times.push(ctrl_time);
+                    if ctrl_time > ACTUATOR_DEADLINE.as_nanos() as u64 {
+                        missed_deadlines += 1;
+                    }
+
+                    let fb_start = Instant::now();
+                    let mut feedback = ActuatorFeedback::new(actuator_id, data.sequence, state);
+                    feedback.response_time_ns = ctrl_time;
+                    if error.abs() > 10.0 {
+                        feedback.calibration_adjustment = Some(-error * 0.1);
+                    }
+                    if let Err(e) = feedback_sender.try_send(feedback.clone()) {
+                        feedback.error_message = Some(format!("Feedback send failed: {}", e));
+                    }
+
+                    let fb_time = fb_start.elapsed().as_nanos() as u64;
+                    feedback_times.push(fb_time);
+                    if fb_time > FEEDBACK_DEADLINE.as_nanos() as u64 {
+                        missed_deadlines += 1;
+                    }
+
+                    local_feedbacks.push(feedback);
+                }
+
+                (local_feedbacks, control_times, feedback_times, missed_deadlines)
+            }));
+        }
+
+        for handle in handles {
+            let (local_feedbacks, control_times, feedback_times, missed) = handle
+                .join()
+                .map_err(|_| "Actuator worker panicked".to_string())?;
+            self.control_times.extend(control_times);
+            self.feedback_times.extend(feedback_times);
+            self.missed_deadlines += missed;
+            feedbacks.extend(local_feedbacks);
         }
 
         // Update cycle counter
@@ -336,8 +375,8 @@ impl ActuatorModule {
 
             // Check for emergency stop
             if self.shared.status_memory.is_emergency_stop() {
-                for actuator in &mut self.actuators {
-                    actuator.set_enabled(false);
+                for actuator in &self.actuators {
+                    actuator.lock().unwrap().set_enabled(false);
                 }
                 break;
             }
@@ -358,14 +397,17 @@ impl ActuatorModule {
         if actuator_id < self.setpoints.len() {
             self.setpoints[actuator_id] = setpoint;
             if let Some(controller) = self.controllers.get_controller(actuator_id) {
-                controller.set_setpoint(setpoint);
+                controller.lock().unwrap().set_setpoint(setpoint);
             }
         }
     }
 
     /// Get all actuator states
     pub fn get_actuator_states(&self) -> Vec<ActuatorState> {
-        self.actuators.iter().map(|a| a.get_state()).collect()
+        self.actuators
+            .iter()
+            .map(|a| a.lock().unwrap().get_state())
+            .collect()
     }
 
     /// Get performance statistics

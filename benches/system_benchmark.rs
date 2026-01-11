@@ -29,7 +29,7 @@ use rts_manufacturing::types::*;
 
 /// Benchmark the ACTUAL SensorModule::run_cycle() - same as main.rs
 fn bench_sensor_module_run_cycle(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_actual_system");
+    let mut group = c.benchmark_group("actual_system");
 
     group.bench_function("sensor_module_run_cycle", |b| {
         // Setup exactly like main.rs does
@@ -58,7 +58,7 @@ fn bench_sensor_module_run_cycle(c: &mut Criterion) {
 
 /// Benchmark the ACTUAL ActuatorModule::run_cycle() - same as main.rs
 fn bench_actuator_module_run_cycle(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_actual_system");
+    let mut group = c.benchmark_group("actual_system");
 
     group.bench_function("actuator_module_run_cycle", |b| {
         // Setup exactly like main.rs does
@@ -97,7 +97,7 @@ fn bench_actuator_module_run_cycle(c: &mut Criterion) {
 
 /// Benchmark COMPLETE end-to-end cycle - sensor → channel → actuator
 fn bench_complete_system_cycle(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_actual_system");
+    let mut group = c.benchmark_group("actual_system");
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("complete_end_to_end_cycle", |b| {
@@ -141,7 +141,7 @@ fn bench_complete_system_cycle(c: &mut Criterion) {
 
 /// Benchmark complete multi-threaded system (sensor + actuator threads)
 fn bench_multithreaded_system_end_to_end(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_actual_system");
+    let mut group = c.benchmark_group("actual_system");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(3));
     group.throughput(Throughput::Elements(1));
@@ -217,7 +217,7 @@ fn bench_multithreaded_system_end_to_end(c: &mut Criterion) {
 
 /// Benchmark sensor generation (0.2ms deadline check)
 fn bench_sensor_generation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_component_timing");
+    let mut group = c.benchmark_group("component_timing");
 
     group.bench_function("sensor_generation", |b| {
         let mut sensor = SensorSimulator::new(SENSOR_FORCE, "Force");
@@ -232,7 +232,7 @@ fn bench_sensor_generation(c: &mut Criterion) {
 
 /// Benchmark data processing with filtering (0.2ms deadline)
 fn bench_data_processing(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_component_timing");
+    let mut group = c.benchmark_group("component_timing");
 
     group.bench_function("data_processing_filter", |b| {
         let mut processor = DataProcessor::new(NUM_SENSOR_TYPES);
@@ -249,7 +249,7 @@ fn bench_data_processing(c: &mut Criterion) {
 
 /// Benchmark PID controller update (part of actuator 1-2ms deadline)
 fn bench_pid_update(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_component_timing");
+    let mut group = c.benchmark_group("component_timing");
 
     group.bench_function("pid_update", |b| {
         let mut pid = PidController::with_defaults("Test");
@@ -265,9 +265,9 @@ fn bench_pid_update(c: &mut Criterion) {
 
 /// Benchmark channel transmission (0.1ms deadline)
 fn bench_channel_transmission(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_component_timing");
+    let mut group = c.benchmark_group("component_timing");
 
-    // Test actual SensorDataChannel (crossbeam bounded)
+    // Test actual SensorDataChannel (std::sync::mpsc bounded)
     group.bench_function("sensor_data_channel", |b| {
         let channel = SensorDataChannel::new(CHANNEL_BUFFER_SIZE);
         let sender = channel.get_sender();
@@ -302,7 +302,7 @@ fn bench_channel_transmission(c: &mut Criterion) {
 
 /// Benchmark shared resource operations
 fn bench_shared_resources(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_component_timing");
+    let mut group = c.benchmark_group("component_timing");
 
     // Atomic counter (what V2 uses for counters)
     group.bench_function("status_memory_increment", |b| {
@@ -322,7 +322,7 @@ fn bench_shared_resources(c: &mut Criterion) {
         })
     });
 
-    // parking_lot::Mutex log write
+    // Mutex log write
     group.bench_function("diagnostic_log_write", |b| {
         let log = DiagnosticLog::new(1000);  // Use direct value
 
@@ -340,16 +340,16 @@ fn bench_shared_resources(c: &mut Criterion) {
 // Compare V2's optimized primitives vs alternatives
 
 fn bench_sync_primitives(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_sync_comparison");
+    let mut group = c.benchmark_group("sync_comparison");
     group.throughput(Throughput::Elements(10000));
 
-    // What V2 uses: parking_lot::Mutex
-    group.bench_function("parking_lot_mutex", |b| {
-        let mutex = parking_lot::Mutex::new(0u64);
+    // std::sync::Mutex baseline
+    group.bench_function("std_mutex", |b| {
+        let mutex = std::sync::Mutex::new(0u64);
 
         b.iter(|| {
             for _ in 0..10000 {
-                let mut guard = mutex.lock();
+                let mut guard = mutex.lock().unwrap();
                 *guard += 1;
                 black_box(*guard);
             }
@@ -368,13 +368,13 @@ fn bench_sync_primitives(c: &mut Criterion) {
         })
     });
 
-    // What V2 uses: parking_lot::RwLock for config
+    // std::sync::RwLock baseline
     group.bench_function("rwlock_read", |b| {
-        let rwlock = parking_lot::RwLock::new(0u64);
+        let rwlock = std::sync::RwLock::new(0u64);
 
         b.iter(|| {
             for _ in 0..10000 {
-                let guard = rwlock.read();
+                let guard = rwlock.read().unwrap();
                 black_box(*guard);
             }
         })
@@ -391,7 +391,7 @@ fn bench_shared_resource_contention(c: &mut Criterion) {
     const THREADS: usize = 4;
     const OPS_PER_THREAD: usize = 200;
 
-    let mut group = c.benchmark_group("v2_shared_resource_contention");
+    let mut group = c.benchmark_group("shared_resource_contention");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(3));
 
@@ -469,7 +469,7 @@ fn bench_shared_resource_contention(c: &mut Criterion) {
 fn bench_priority_inversion_simulated(c: &mut Criterion) {
     const HOLD_TIME_US: u64 = 500;
 
-    let mut group = c.benchmark_group("v2_priority_inversion");
+    let mut group = c.benchmark_group("priority_inversion");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(3));
     group.throughput(Throughput::Elements(1));
@@ -563,7 +563,7 @@ fn simulate_cpu_load(load_percent: f64, duration_us: u64) {
 }
 
 fn bench_cpu_load_impact(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v2_cpu_load_impact");
+    let mut group = c.benchmark_group("cpu_load_impact");
     group.throughput(Throughput::Elements(100));
 
     // 0% load (baseline)
@@ -736,3 +736,4 @@ criterion_main!(
     priority_inversion_benches,
     load_benches
 );
+

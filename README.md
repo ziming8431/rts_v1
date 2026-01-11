@@ -32,8 +32,7 @@ The system demonstrates real-time programming concepts including:
 - Multi-threaded concurrent operation
 - Shared resource synchronization (Mutex, RwLock, Atomics)
 - Inter-process communication via channels
-- Deadline monitoring and fail-safe mechanisms
-- Performance benchmarking
+- Deadline monitoring and performance benchmarking
 
 ---
 
@@ -51,10 +50,7 @@ The system demonstrates real-time programming concepts including:
 
 ### Advanced Features (Distinction Level)
 - ✅ **Fault Injection**: Simulated sensor dropouts, delays, and data corruption
-- ✅ **Fail-Safe Mode**: Automatic degradation when thresholds are violated
 - ✅ **CPU Load Simulation**: Testing under varying system loads
-- ✅ **Async vs Multi-Threaded Comparison**: Performance comparison between paradigms
-- ✅ **Health Monitoring**: Real-time system health assessment
 
 ---
 
@@ -89,8 +85,6 @@ The system demonstrates real-time programming concepts including:
 │ └─────────────────┘ │   Feedback   │ └─────────────────────┘ │
 │                     │   (Channel)  │                         │
 │                     │              │ ┌─────────────────────┐ │
-│                     │              │ │ Fail-Safe Manager   │ │
-│                     │              │ │ Health Monitor      │ │
 │                     │              │ └─────────────────────┘ │
 └─────────────────────┘              └─────────────────────────┘
 ```
@@ -104,9 +98,7 @@ The system demonstrates real-time programming concepts including:
 - **OS**: Linux, macOS, or Windows
 
 ### Dependencies (managed by Cargo)
-- `crossbeam` / `crossbeam-channel`: High-performance channels
-- `parking_lot`: Fast synchronization primitives
-- `tokio`: Async runtime for comparison benchmarks
+- Standard library sync and channels (std::sync, std::sync::mpsc)
 - `rand` / `rand_distr`: Random number generation
 - `serde` / `serde_json`: Serialization
 - `criterion`: Benchmarking framework
@@ -170,7 +162,6 @@ rts_project/
 │   ├── shared_resource.rs  # Shared resources with synchronization
 │   ├── ipc.rs              # Inter-process communication channels
 │   ├── fault_injection.rs  # Fault injection for testing
-│   ├── failsafe.rs         # Fail-safe and health monitoring
 │   └── benchmark.rs        # Performance benchmarking utilities
 └── benches/
     └── system_benchmark.rs # Criterion benchmark suite
@@ -201,7 +192,6 @@ rts_project/
 2. Apply PID control to compute actuator outputs
 3. Manage multiple actuators concurrently
 4. Send feedback within 0.5ms deadline
-5. Handle fail-safe transitions
 
 **Key Classes:**
 - `VirtualActuator`: Simulates physical actuator dynamics
@@ -230,32 +220,13 @@ fault_injector.set_probabilities(
 );
 ```
 
-### 2. Fail-Safe Mode (`failsafe.rs`)
-
-State machine with transitions:
-```
-Normal → Warning → Degraded → Critical → Recovery → Normal
-```
-
-Triggered by:
-- Consecutive missed deadlines
-- Consecutive sensor anomalies
-- Manual trigger
-
-### 3. CPU Load Simulation
+### 2. CPU Load Simulation
 
 Tests performance under load:
 - 0% load (baseline)
 - 30% load
 - 60% load
 - 80% load
-
-### 4. Async vs Multi-Threaded Comparison
-
-Compares:
-- Average latency
-- Maximum latency
-- Throughput (ops/sec)
 
 ---
 
@@ -308,9 +279,6 @@ pub const PID_KP: f64 = 0.5;  // Proportional gain
 pub const PID_KI: f64 = 0.1;  // Integral gain
 pub const PID_KD: f64 = 0.05; // Derivative gain
 
-// Fail-Safe Thresholds
-pub const FAILSAFE_MISSED_DEADLINE_THRESHOLD: usize = 3;
-pub const FAILSAFE_ANOMALY_THRESHOLD: usize = 5;
 
 // Fault Injection
 pub const FAULT_DROPOUT_PROBABILITY: f64 = 0.05;
@@ -345,7 +313,6 @@ Actuator Performance:
   Avg Control Time:      2.800 µs
   Avg Feedback Time:     1.500 µs
   Missed Deadlines:      0
-  Fail-Safe State:       Normal
 
 === Shared Resource Synchronization Statistics ===
 Diagnostic Log:

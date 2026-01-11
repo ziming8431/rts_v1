@@ -6,10 +6,7 @@ authors = ["Student"]
 description = "Real-Time Sensor-Actuator System for Automated Manufacturing"
 
 [dependencies]
-# Concurrency and Threading
-crossbeam = "0.8.4"
-crossbeam-channel = "0.5.15"
-parking_lot = "0.12.5"
+# Concurrency and Threading (std::sync + std::sync::mpsc)
 
 # Time and Timing
 chrono = "0.4"

@@ -92,7 +92,7 @@ pub const PID_OUTPUT_MAX: f64 = 100.0;
 pub const MAX_SIMULATION_CYCLES: usize = 1000;
 
 /// Demo cycles for multi-threaded integration run
-pub const DEMO_INTEGRATION_CYCLES: usize = 5000;
+pub const DEMO_INTEGRATION_CYCLES: usize = 2000;
 
 /// Demo cycles for fault injection run
 pub const DEMO_FAULT_INJECTION_CYCLES: usize = 300;
@@ -101,7 +101,7 @@ pub const DEMO_FAULT_INJECTION_CYCLES: usize = 300;
 pub const DEMO_LOAD_CYCLES: usize = 200;
 
 /// Channel buffer size for IPC
-pub const CHANNEL_BUFFER_SIZE: usize = 100;
+pub const CHANNEL_BUFFER_SIZE: usize = 500;
 
 /// Shared resource access timeout
 pub const RESOURCE_ACCESS_TIMEOUT: Duration = Duration::from_millis(1);

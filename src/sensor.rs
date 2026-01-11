@@ -9,6 +9,7 @@
 // ============================================================================
 
 use crate::config::*;
+use crate::fault_injection::{FaultInjector, FaultRecord, FaultType};
 use crate::ipc::*;
 use crate::shared_resource::*;
 use crate::types::*;
@@ -16,7 +17,7 @@ use rand_distr::{Distribution, Normal};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ----------------------------------------------------------------------------
 // Sensor Simulator
@@ -287,6 +288,10 @@ pub struct SensorModule {
     transmission_times: Vec<u64>,
     missed_deadlines: usize,
     total_cycles: u64,
+    /// Last known-good data per sensor for recovery
+    last_good_data: Vec<Option<ProcessedSensorData>>,
+    /// Recovery actions applied during fault handling
+    recovery_count: usize,
 }
 
 impl SensorModule {
@@ -314,6 +319,8 @@ impl SensorModule {
             transmission_times: Vec::new(),
             missed_deadlines: 0,
             total_cycles: 0,
+            last_good_data: vec![None; NUM_SENSOR_TYPES],
+            recovery_count: 0,
         }
     }
 
@@ -372,6 +379,10 @@ impl SensorModule {
                 );
             }
 
+            if !processed.is_anomaly && processed.confidence >= 0.5 {
+                self.last_good_data[processed.sensor_id] = Some(processed.clone());
+            }
+
             processed_data.push(processed);
         }
 
@@ -406,6 +417,181 @@ impl SensorModule {
         }
 
         Ok(processed_data)
+    }
+
+    /// Run one cycle with fault injection applied before transmission
+    pub fn run_cycle_with_faults(
+        &mut self,
+        fault_injector: &mut FaultInjector,
+    ) -> Result<Vec<(ProcessedSensorData, FaultRecord)>, String> {
+        let _cycle_start = Instant::now();
+        let mut processed_data = Vec::with_capacity(NUM_SENSOR_TYPES);
+
+        // Pull latest configuration for calibration/anomaly tuning.
+        let config = self.shared.config_buffer.read();
+        self.processor.apply_config(&config);
+
+        // Phase 1: Generate sensor data
+        let gen_start = Instant::now();
+        let inject_anomaly = ANOMALY_INJECTION_PERIOD > 0
+            && self.total_cycles > 0
+            && (self.total_cycles % ANOMALY_INJECTION_PERIOD as u64 == 0);
+        let readings: Vec<SensorReading> = self
+            .sensors
+            .iter_mut()
+            .map(|s| {
+                if inject_anomaly && s.get_id() == SENSOR_FORCE {
+                    s.generate_anomaly()
+                } else {
+                    s.generate_reading()
+                }
+            })
+            .collect();
+        let gen_time = gen_start.elapsed().as_nanos() as u64;
+        self.generation_times.push(gen_time);
+
+        // Phase 2: Process each reading
+        for reading in &readings {
+            let proc_start = Instant::now();
+            let mut processed = self.processor.process(reading);
+            if inject_anomaly && reading.sensor_id == SENSOR_FORCE {
+                processed.is_anomaly = true;
+                processed.confidence = processed.confidence.min(0.2);
+            }
+            let proc_time = proc_start.elapsed().as_nanos() as u64;
+            self.processing_times.push(proc_time);
+
+            // Check processing deadline
+            if proc_time > PROCESSING_DEADLINE.as_nanos() as u64 {
+                self.missed_deadlines += 1;
+                self.shared.status_memory.increment_missed_deadlines();
+            }
+
+            // Track anomalies
+            if processed.is_anomaly {
+                self.shared.status_memory.increment_anomalies();
+                self.shared.diagnostic_log.try_log(
+                    LogLevel::Warning,
+                    "Sensor",
+                    &format!(
+                        "Anomaly detected on sensor {}: {:.2}",
+                        processed.sensor_id, processed.filtered_value
+                    ),
+                );
+            }
+
+            if !processed.is_anomaly && processed.confidence >= 0.5 {
+                self.last_good_data[processed.sensor_id] = Some(processed.clone());
+            }
+
+            processed_data.push(processed);
+        }
+
+        // Phase 3: Transmit data with fault injection
+        let mut sent_data = Vec::with_capacity(processed_data.len());
+        for data in processed_data {
+            let sensor_id = data.sensor_id;
+            let sequence = data.sequence;
+            let original_value = data.filtered_value;
+            let tx_start = Instant::now();
+            let maybe_faulted = fault_injector.apply_fault(data);
+            let tx_time = tx_start.elapsed().as_nanos() as u64;
+            self.transmission_times.push(tx_time);
+
+            if tx_time > TRANSMISSION_DEADLINE.as_nanos() as u64 {
+                self.missed_deadlines += 1;
+            }
+
+            if let Some((mut faulty_data, record)) = maybe_faulted {
+                if matches!(record.fault_type, FaultType::Noise) {
+                    faulty_data.is_anomaly = true;
+                    faulty_data.confidence = faulty_data.confidence.min(0.3);
+                }
+
+                if matches!(record.fault_type, FaultType::Corruption | FaultType::Noise) {
+                    if let Some(last_good) = self.last_good_data[sensor_id].clone() {
+                        faulty_data = Self::build_recovery_data(last_good, sequence);
+                        self.recovery_count += 1;
+                        self.shared.diagnostic_log.try_log(
+                            LogLevel::Warning,
+                            "Sensor",
+                            &format!(
+                                "Recovered from {:?} on sensor {} using last good reading",
+                                record.fault_type, sensor_id
+                            ),
+                        );
+                    }
+                }
+
+                self.data_sender
+                    .try_send(faulty_data.clone())
+                    .map_err(|e| format!("Transmission failed: {}", e))?;
+
+                if record.fault_type != FaultType::None {
+                    self.shared.diagnostic_log.try_log(
+                        LogLevel::Warning,
+                        "Sensor",
+                        &format!(
+                            "Injected {:?} fault on sensor {}",
+                            record.fault_type, record.sensor_id
+                        ),
+                    );
+                }
+
+                if matches!(record.fault_type, FaultType::None | FaultType::Delay) {
+                    self.last_good_data[sensor_id] = Some(faulty_data.clone());
+                }
+
+                sent_data.push((faulty_data, record));
+            } else if let Some(last_good) = self.last_good_data[sensor_id].clone() {
+                let recovery = Self::build_recovery_data(last_good, sequence);
+                let record = FaultRecord {
+                    fault_type: FaultType::Dropout,
+                    timestamp_ns: recovery.timestamp_ns,
+                    sensor_id,
+                    original_value: Some(original_value),
+                    corrupted_value: None,
+                    delay: None,
+                };
+                self.data_sender
+                    .try_send(recovery.clone())
+                    .map_err(|e| format!("Transmission failed: {}", e))?;
+                self.recovery_count += 1;
+                self.shared.diagnostic_log.try_log(
+                    LogLevel::Warning,
+                    "Sensor",
+                    &format!(
+                        "Dropout detected on sensor {}, using last good reading",
+                        sensor_id
+                    ),
+                );
+                sent_data.push((recovery, record));
+            } else {
+                self.shared.diagnostic_log.try_log(
+                    LogLevel::Warning,
+                    "Sensor",
+                    &format!("Dropped packet from sensor {} (no recovery available)", sensor_id),
+                );
+            }
+        }
+
+        // Phase 4: Process any feedback
+        self.process_feedback();
+
+        // Update cycle counter
+        self.total_cycles += 1;
+        self.shared.status_memory.increment_cycles();
+
+        // Log to shared diagnostic (non-blocking)
+        if self.total_cycles % 100 == 0 {
+            self.shared.diagnostic_log.try_log(
+                LogLevel::Info,
+                "Sensor",
+                &format!("Completed {} cycles", self.total_cycles),
+            );
+        }
+
+        Ok(sent_data)
     }
 
     /// Process feedback from actuator module
@@ -498,6 +684,11 @@ impl SensorModule {
         }
     }
 
+    /// Get number of recovery actions performed during fault injection
+    pub fn get_recovery_count(&self) -> usize {
+        self.recovery_count
+    }
+
     /// Print performance summary
     pub fn print_stats(&self) {
         let stats = self.get_stats();
@@ -506,6 +697,22 @@ impl SensorModule {
         stats.transmission.print_summary("Sensor Transmission");
         println!("\n  Total Sensor Cycles: {}", stats.total_cycles);
         println!("  Total Missed Deadlines: {}", stats.missed_deadlines);
+    }
+}
+
+impl SensorModule {
+    fn build_recovery_data(
+        mut last_good: ProcessedSensorData,
+        sequence: u64,
+    ) -> ProcessedSensorData {
+        last_good.sequence = sequence;
+        last_good.timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        last_good.is_anomaly = true;
+        last_good.confidence = last_good.confidence.min(0.2);
+        last_good
     }
 }
 

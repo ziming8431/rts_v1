@@ -7,6 +7,7 @@
 // ============================================================================
 
 use crate::config::*;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 // ----------------------------------------------------------------------------
@@ -187,7 +188,7 @@ impl PidController {
 
 /// Manages multiple PID controllers for different actuators
 pub struct PidControllerBank {
-    controllers: Vec<PidController>,
+    controllers: Vec<Arc<Mutex<PidController>>>,
 }
 
 impl PidControllerBank {
@@ -220,24 +221,25 @@ impl PidControllerBank {
                 _ => {}
             }
             
-            controllers.push(controller);
+            controllers.push(Arc::new(Mutex::new(controller)));
         }
         
         Self { controllers }
     }
 
-    /// Get a mutable reference to a specific controller
-    pub fn get_controller(&mut self, index: usize) -> Option<&mut PidController> {
-        self.controllers.get_mut(index)
+    /// Get a handle to a specific controller
+    pub fn get_controller(&self, index: usize) -> Option<Arc<Mutex<PidController>>> {
+        self.controllers.get(index).cloned()
     }
 
     /// Update all controllers with new measurements
     /// measurements[i] corresponds to controller[i]
     pub fn update_all(&mut self, measurements: &[f64]) -> Vec<(f64, f64)> {
         self.controllers
-            .iter_mut()
+            .iter()
             .zip(measurements.iter())
             .map(|(controller, &measurement)| {
+                let mut controller = controller.lock().unwrap();
                 let (output, error, _dt) = controller.update(measurement);
                 (output, error)
             })
@@ -246,27 +248,30 @@ impl PidControllerBank {
 
     /// Set setpoints for all controllers
     pub fn set_setpoints(&mut self, setpoints: &[f64]) {
-        for (controller, &setpoint) in self.controllers.iter_mut().zip(setpoints.iter()) {
-            controller.set_setpoint(setpoint);
+        for (controller, &setpoint) in self.controllers.iter().zip(setpoints.iter()) {
+            controller.lock().unwrap().set_setpoint(setpoint);
         }
     }
 
     /// Reset all controllers
     pub fn reset_all(&mut self) {
-        for controller in &mut self.controllers {
-            controller.reset();
+        for controller in &self.controllers {
+            controller.lock().unwrap().reset();
         }
     }
 
     /// Get all controller names
-    pub fn get_names(&self) -> Vec<&str> {
-        self.controllers.iter().map(|c| c.get_name()).collect()
+    pub fn get_names(&self) -> Vec<String> {
+        self.controllers
+            .iter()
+            .map(|c| c.lock().unwrap().get_name().to_string())
+            .collect()
     }
 
     /// Update PID gains from configuration
     pub fn update_gains_from_config(&mut self, kp: f64, ki: f64, kd: f64) {
-        for controller in &mut self.controllers {
-            controller.set_gains(kp, ki, kd);
+        for controller in &self.controllers {
+            controller.lock().unwrap().set_gains(kp, ki, kd);
         }
     }
 }
